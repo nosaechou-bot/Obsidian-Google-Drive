@@ -17,21 +17,20 @@ describe('fixDrivePath', () => {
 	});
 
 	it('rebuilds the Drive ID mapping and clears pending operations', async () => {
-		const searchFiles = vi.fn(async () => [
+		const scanVaultTree = vi.fn(async () => [
 			{
-				id: 'short-path-id',
-				properties: { path: 'folder/note.md' },
+				file: { id: 'short-path-id' },
+				path: 'folder/note.md',
 			},
 			{
-				id: 'split-path-id',
-				properties: {
-					path: 'long/folder/',
-					path2: 'nested/note.md',
-				},
+				file: { id: 'split-path-id' },
+				path: 'long/folder/nested/note.md',
 			},
 		]);
+		const saveSettings = vi.fn(async () => undefined);
 		const plugin = {
-			drive: { searchFiles },
+			drive: { scanVaultTree },
+			saveSettings,
 			settings: {
 				driveIdToPath: { stale: 'old/path.md' },
 				operations: { 'pending.md': 'create' },
@@ -40,14 +39,13 @@ describe('fixDrivePath', () => {
 
 		await fixDrivePath(plugin as never);
 
-		expect(searchFiles).toHaveBeenCalledWith({
-			include: ['id', 'properties'],
-		});
+		expect(scanVaultTree).toHaveBeenCalledOnce();
 		expect(plugin.settings.driveIdToPath).toEqual({
 			'short-path-id': 'folder/note.md',
 			'split-path-id': 'long/folder/nested/note.md',
 		});
 		expect(plugin.settings.operations).toEqual({});
+		expect(saveSettings).toHaveBeenCalledOnce();
 		expect(notice).toHaveBeenCalledWith(
 			'Google Drive paths have been fixed. Please restart the plugin to apply changes.',
 		);
@@ -57,7 +55,7 @@ describe('fixDrivePath', () => {
 		const driveIdToPath = { existing: 'note.md' };
 		const operations = { 'pending.md': 'modify' };
 		const plugin = {
-			drive: { searchFiles: vi.fn(async () => undefined) },
+			drive: { scanVaultTree: vi.fn(async () => undefined) },
 			settings: { driveIdToPath, operations },
 		};
 

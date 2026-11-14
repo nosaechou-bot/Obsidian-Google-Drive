@@ -111,6 +111,7 @@ describe('push', () => {
 		]);
 		const syncNotice = { setMessage: vi.fn(), hide: vi.fn() };
 		const drive = {
+			scanVaultTree: vi.fn(async () => []),
 			searchFiles: vi
 				.fn()
 				.mockResolvedValueOnce([])

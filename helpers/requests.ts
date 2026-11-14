@@ -186,3 +186,53 @@ export const refreshAccessToken = async (
 	}
 	return;
 };
+
+export const buildGoogleAuthUrl = (
+	clientId: string,
+	redirectUri = 'http://localhost',
+) =>
+	`https://accounts.google.com/o/oauth2/v2/auth?${new URLSearchParams({
+		client_id: clientId,
+		redirect_uri: redirectUri,
+		response_type: 'code',
+		scope: 'https://www.googleapis.com/auth/drive',
+		access_type: 'offline',
+		prompt: 'consent',
+	}).toString()}`;
+
+export const exchangeCodeForRefreshToken = async (
+	clientId: string,
+	clientSecret: string,
+	codeInput: string,
+	redirectUri = 'http://localhost',
+): Promise<string | undefined> => {
+	let code = codeInput.trim();
+	if (code.startsWith('http://') || code.startsWith('https://')) {
+		try {
+			code = new URL(code).searchParams.get('code')?.trim() ?? '';
+		} catch {
+			return;
+		}
+	}
+	if (!code) return;
+
+	try {
+		const response = await requestUrl({
+			url: 'https://oauth2.googleapis.com/token',
+			method: 'POST',
+			contentType: 'application/x-www-form-urlencoded',
+			body: new URLSearchParams({
+				client_id: clientId,
+				client_secret: clientSecret,
+				code,
+				grant_type: 'authorization_code',
+				redirect_uri: redirectUri,
+			}).toString(),
+			throw: false,
+		});
+		if (response.status < 200 || response.status >= 300) return;
+		return (response.json as { refresh_token?: string })?.refresh_token;
+	} catch {
+		return;
+	}
+};

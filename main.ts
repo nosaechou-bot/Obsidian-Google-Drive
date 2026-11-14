@@ -1,5 +1,9 @@
 import { checkConnection, getDriveClient } from './helpers/drive';
-import { refreshAccessToken } from './helpers/requests';
+import {
+	buildGoogleAuthUrl,
+	exchangeCodeForRefreshToken,
+	refreshAccessToken,
+} from './helpers/requests';
 import { pull } from './helpers/pull';
 import { push } from './helpers/push';
 import { reset } from './helpers/reset';
@@ -21,6 +25,8 @@ interface PluginSettings {
 	clientSecret: string;
 	accessTokenUrl: string;
 	autoPush: boolean;
+	preferCloudWhenNewer: boolean;
+	backupOnConflict: boolean;
 	operations: Record<string, 'create' | 'delete' | 'modify'>;
 	driveIdToPath: Record<string, string>;
 	rootFolderId: string;
@@ -34,6 +40,8 @@ const DEFAULT_SETTINGS: PluginSettings = {
 	clientSecret: '',
 	accessTokenUrl: '',
 	autoPush: false,
+	preferCloudWhenNewer: true,
+	backupOnConflict: true,
 	operations: {},
 	driveIdToPath: {},
 	rootFolderId: '',
@@ -49,6 +57,7 @@ export default class ObsidianGoogleDrive extends Plugin {
 	};
 	drive = getDriveClient(this);
 	ribbonIcon!: HTMLElement;
+	pullRibbonIcon?: HTMLElement;
 	syncing!: boolean;
 	autoPushTimer?: number;
 
@@ -76,6 +85,15 @@ export default class ObsidianGoogleDrive extends Plugin {
 			},
 		);
 
+		this.pullRibbonIcon = this.addRibbonIcon(
+			'download',
+			'Pull from Google Drive',
+			() => {
+				if (this.syncing) return;
+				void pull(this);
+			},
+		);
+
 		this.addCommand({
 			id: 'push',
 			name: 'Push to Google Drive',
@@ -86,6 +104,12 @@ export default class ObsidianGoogleDrive extends Plugin {
 			id: 'pull',
 			name: 'Pull from Google Drive',
 			callback: () => pull(this),
+		});
+
+		this.addCommand({
+			id: 'force-pull',
+			name: 'Force pull from Google Drive (prefer cloud changes)',
+			callback: () => pull(this, false, true),
 		});
 
 		this.addCommand({
@@ -123,6 +147,7 @@ export default class ObsidianGoogleDrive extends Plugin {
 
 				this.syncing = true;
 				this.ribbonIcon.addClass('spin');
+				this.pullRibbonIcon?.addClass('spin');
 				try {
 					if (await pull(this, true)) await this.endSync();
 				} finally {
@@ -302,6 +327,17 @@ export default class ObsidianGoogleDrive extends Plugin {
 		if (!oldOperation) delete this.settings.operations[file.path];
 	}
 
+	async renameFile(file: TAbstractFile, newPath: string) {
+		const oldPath = file.path;
+		const oldOp = this.settings.operations[oldPath];
+		const newOp = this.settings.operations[newPath];
+		await this.app.vault.rename(file, newPath);
+		if (oldOp) this.settings.operations[oldPath] = oldOp;
+		else delete this.settings.operations[oldPath];
+		if (newOp) this.settings.operations[newPath] = newOp;
+		else delete this.settings.operations[newPath];
+	}
+
 	async startSync() {
 		if (!(await checkConnection())) {
 			new Notice(
@@ -311,6 +347,7 @@ export default class ObsidianGoogleDrive extends Plugin {
 		}
 		this.clearAutoPushTimer();
 		this.ribbonIcon.addClass('spin');
+		this.pullRibbonIcon?.addClass('spin');
 		this.syncing = true;
 		return new Notice('Syncing (0%)', 0);
 	}
@@ -343,6 +380,7 @@ export default class ObsidianGoogleDrive extends Plugin {
 		this.settings.changesToken = changesToken;
 		await this.saveSettings();
 		this.ribbonIcon.removeClass('spin');
+		this.pullRibbonIcon?.removeClass('spin');
 		this.syncing = false;
 		syncNotice?.hide();
 		this.resumeAutoPushIfNeeded();
@@ -351,6 +389,7 @@ export default class ObsidianGoogleDrive extends Plugin {
 
 	abortSync(syncNotice?: Notice) {
 		this.ribbonIcon.removeClass('spin');
+		this.pullRibbonIcon?.removeClass('spin');
 		this.syncing = false;
 		syncNotice?.hide();
 		this.resumeAutoPushIfNeeded();
@@ -367,6 +406,42 @@ class SettingsTab extends PluginSettingTab {
 
 	getSettingDefinitions(): SettingDefinitionItem[] {
 		return [
+			{
+				name: 'Sync actions',
+				desc: 'Manually pull or push changes with Google Drive.',
+				render: (setting) => {
+					setting
+						.addButton((btn) =>
+							btn
+								.setButtonText('Pull')
+								.setCta()
+								.onClick(() => {
+									if (this.plugin.syncing) return;
+									void pull(this.plugin);
+								}),
+						)
+						.addButton((btn) =>
+							btn
+								.setButtonText('Force pull')
+								.onClick(() => {
+									if (this.plugin.syncing) return;
+									void pull(this.plugin, false, true);
+								}),
+						)
+						.addButton((btn) =>
+							btn.setButtonText('Push').onClick(() => {
+								if (this.plugin.syncing) return;
+								void push(this.plugin);
+							}),
+						)
+						.addButton((btn) =>
+							btn.setButtonText('Fix paths').onClick(() => {
+								if (this.plugin.syncing) return;
+								void fixDrivePath(this.plugin);
+							}),
+						);
+				},
+			},
 			{
 				name: 'Get refresh token',
 				render: (setting) => {
@@ -433,6 +508,24 @@ class SettingsTab extends PluginSettingTab {
 				},
 			},
 			{
+				name: 'Prefer cloud changes when newer',
+				desc: 'Overwrite local changes during pull when the Google Drive file has a newer modification time.',
+				control: {
+					type: 'toggle',
+					key: 'preferCloudWhenNewer',
+					defaultValue: true,
+				},
+			},
+			{
+				name: 'Back up local file on conflict',
+				desc: 'Save a conflict copy of the local file before overwriting it with a newer cloud version.',
+				control: {
+					type: 'toggle',
+					key: 'backupOnConflict',
+					defaultValue: true,
+				},
+			},
+			{
 				name: 'Access token endpoint',
 				desc: 'Service used to exchange the refresh token for a Google access token. The refresh token is sent to this URL. This is just so you can self-host the access token refresher. The code to host the website is available at https://github.com/RichardX366/Obsidian-Google-Drive-website. Defaults to my hosted service at https://ogd-server.richardxiong.com/api/access.',
 				control: {
@@ -469,6 +562,76 @@ class SettingsTab extends PluginSettingTab {
 					type: 'text',
 					key: 'clientSecret',
 					placeholder: 'Client secret',
+				},
+			},
+			{
+				name: 'Authorize full Drive access (for Gemini and external files)',
+				desc: 'Enter Client ID and Client secret above, open the auth URL, sign in, then paste the redirected localhost URL or code parameter below.',
+				render: (setting) => {
+					let codeValue = '';
+					setting
+						.addButton((btn) =>
+							btn.setButtonText('Open auth URL').onClick(() => {
+								const { clientId } = this.plugin.settings;
+								if (!clientId) {
+									new Notice(
+										'Please enter your client ID first.',
+									);
+									return;
+								}
+								window.open(buildGoogleAuthUrl(clientId));
+							}),
+						)
+						.addText((text) =>
+							text
+								.setPlaceholder(
+									'Paste localhost URL or auth code',
+								)
+								.onChange((val) => {
+									codeValue = val;
+								}),
+						)
+						.addButton((btn) =>
+							btn
+								.setButtonText('Exchange code')
+								.setCta()
+								.onClick(async () => {
+									const { clientId, clientSecret } =
+										this.plugin.settings;
+									if (
+										!clientId ||
+										!clientSecret ||
+										!codeValue
+									) {
+										new Notice(
+											'Please provide client ID, client secret, and the authorization code.',
+										);
+										return;
+									}
+									const newRefreshToken =
+										await exchangeCodeForRefreshToken(
+											clientId,
+											clientSecret,
+											codeValue,
+										);
+									if (!newRefreshToken) {
+										new Notice(
+											'Failed to exchange authorization code for refresh token.',
+										);
+										return;
+									}
+									this.plugin.settings.refreshToken =
+										newRefreshToken;
+									await refreshAccessToken(
+										this.plugin,
+										newRefreshToken,
+									);
+									await this.plugin.saveSettings();
+									new Notice(
+										'Full Google Drive access refresh token saved!',
+									);
+								}),
+						);
 				},
 			},
 		];

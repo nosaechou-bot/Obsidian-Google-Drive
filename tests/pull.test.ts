@@ -30,6 +30,7 @@ vi.mock('obsidian', () => {
 });
 
 import { pull } from '../helpers/pull';
+import { googleDocMimeType } from '../helpers/drive';
 import { TFile } from 'obsidian';
 
 const createPlugin = () => {
@@ -38,9 +39,11 @@ const createPlugin = () => {
 		stat: vi.fn(
 			async (
 				_path: string,
-			): Promise<{ type: 'file' | 'folder' } | undefined> =>
+			): Promise<{ type: 'file' | 'folder'; mtime?: number } | undefined> =>
 				undefined,
 		),
+		readBinary: vi.fn(async () => new ArrayBuffer(2)),
+		writeBinary: vi.fn(async () => undefined),
 		trashLocal: vi.fn(async () => true),
 		trashSystem: vi.fn(async () => true),
 		remove: vi.fn(async () => undefined),
@@ -54,7 +57,7 @@ const createPlugin = () => {
 		getAbstractFileByPath: vi.fn(
 			(_path: string): TFile | null => null,
 		),
-		getFileByPath: vi.fn((_path: string) => null),
+		getFileByPath: vi.fn((_path: string): TFile | null => null),
 		getFolderByPath: vi.fn((_path: string) => null),
 		getConfig: vi.fn(() => 'local'),
 	};
@@ -64,24 +67,36 @@ const createPlugin = () => {
 		settings: {
 			lastSyncedAt: 0,
 			changesToken: 'changes',
+			preferCloudWhenNewer: true,
+			backupOnConflict: true,
 			driveIdToPath: {} as Record<string, string>,
 			operations: {} as Record<string, 'create' | 'delete' | 'modify'>,
 		},
 		drive: {
-			searchFiles: vi.fn(
-				async (): Promise<unknown[] | undefined> => [],
+			scanVaultTree: vi.fn(
+				async (): Promise<
+					{ file: Record<string, unknown>; path: string }[] | undefined
+				> => [],
 			),
 			getChanges: vi.fn(
-				async (): Promise<{ removed: boolean; fileId: string }[]> => [],
+				async (): Promise<
+					{
+						removed: boolean;
+						fileId: string;
+						file?: { trashed?: boolean };
+					}[]
+				> => [],
 			),
 			deleteFilesMinimumOperations: vi.fn(async () => undefined),
 			getFile: vi.fn(),
+			exportFile: vi.fn(),
 		},
 		abortSync: vi.fn(),
 		endSync: vi.fn(async () => true),
 		createFolder: vi.fn(),
 		modifyFile: vi.fn(),
 		upsertFile: vi.fn(),
+		renameFile: vi.fn(),
 	};
 };
 
@@ -101,7 +116,7 @@ describe('pull', () => {
 
 	it('aborts when Drive files cannot be listed', async () => {
 		const plugin = createPlugin();
-		plugin.drive.searchFiles.mockResolvedValueOnce(undefined);
+		plugin.drive.scanVaultTree.mockResolvedValueOnce(undefined);
 
 		await expect(pull(plugin as never, true)).resolves.toBe(false);
 
@@ -187,18 +202,24 @@ describe('pull', () => {
 		plugin.app.vault.adapter.stat.mockImplementation(async (path: string) =>
 			path === configPath ? { type: 'file' as const } : undefined,
 		);
-		plugin.drive.searchFiles.mockResolvedValueOnce([
+		plugin.drive.scanVaultTree.mockResolvedValueOnce([
 			{
-				id: 'folder-id',
-				mimeType: 'application/vnd.google-apps.folder',
-				properties: { path: 'remote' },
-				modifiedTime: '2025-01-01T00:00:00.000Z',
+				file: {
+					id: 'folder-id',
+					mimeType: 'application/vnd.google-apps.folder',
+					properties: { path: 'remote' },
+					modifiedTime: '2025-01-01T00:00:00.000Z',
+				},
+				path: 'remote',
 			},
 			{
-				id: 'note-id',
-				mimeType: 'text/markdown',
-				properties: { path: 'remote/note.md' },
-				modifiedTime: '2025-01-01T00:00:00.000Z',
+				file: {
+					id: 'note-id',
+					mimeType: 'text/markdown',
+					properties: { path: 'remote/note.md' },
+					modifiedTime: '2025-01-01T00:00:00.000Z',
+				},
+				path: 'remote/note.md',
 			},
 		]);
 		plugin.drive.getChanges.mockResolvedValueOnce([
@@ -226,6 +247,223 @@ describe('pull', () => {
 		expect(plugin.settings.driveIdToPath).toEqual({
 			'folder-id': 'remote',
 			'note-id': 'remote/note.md',
+		});
+	});
+
+	it('pulls externally created files without properties and creates missing parent folders', async () => {
+		const plugin = createPlugin();
+		plugin.settings.lastSyncedAt = Date.parse('2026-11-15T00:00:00.000Z');
+		plugin.drive.scanVaultTree.mockResolvedValueOnce([
+			{
+				file: {
+					id: 'gemini-note-id',
+					name: '2026-11-14.md',
+					mimeType: 'text/markdown',
+					modifiedTime: '2026-11-14T10:00:00.000Z',
+				},
+				path: 'Daily/2026-11-14.md',
+			},
+		]);
+		plugin.drive.getFile.mockReturnValue({
+			arrayBuffer: vi.fn(async () => new ArrayBuffer(8)),
+		});
+
+		await expect(pull(plugin as never, true)).resolves.toBe(true);
+
+		expect(plugin.createFolder).toHaveBeenCalledWith('Daily');
+		expect(plugin.upsertFile).toHaveBeenCalledWith(
+			'Daily/2026-11-14.md',
+			expect.any(ArrayBuffer),
+			'2026-11-14T10:00:00.000Z',
+		);
+		expect(plugin.settings.driveIdToPath).toEqual({
+			'gemini-note-id': 'Daily/2026-11-14.md',
+		});
+	});
+
+	it('exports Google Docs as markdown instead of calling getFile', async () => {
+		const plugin = createPlugin();
+		const mdBuffer = new TextEncoder().encode('# Gemini Summary').buffer;
+		plugin.drive.scanVaultTree.mockResolvedValueOnce([
+			{
+				file: {
+					id: 'gdoc-id',
+					name: '物理筆記',
+					mimeType: googleDocMimeType,
+					modifiedTime: '2026-11-14T12:00:00.000Z',
+				},
+				path: '物理筆記.md',
+			},
+		]);
+		plugin.drive.exportFile.mockReturnValue({
+			arrayBuffer: vi.fn(async () => mdBuffer),
+		});
+
+		await expect(pull(plugin as never, true)).resolves.toBe(true);
+
+		expect(plugin.drive.getFile).not.toHaveBeenCalled();
+		expect(plugin.drive.exportFile).toHaveBeenCalledWith(
+			'gdoc-id',
+			'text/markdown',
+		);
+		expect(plugin.upsertFile).toHaveBeenCalledWith(
+			'物理筆記.md',
+			mdBuffer,
+			'2026-11-14T12:00:00.000Z',
+		);
+	});
+
+	it('overwrites local modify when cloud is newer, backs up local file, and clears operations', async () => {
+		const plugin = createPlugin();
+		const localFile = new TFile();
+		Object.assign(localFile, {
+			path: 'note.md',
+			stat: { mtime: Date.parse('2026-11-14T08:00:00.000Z') },
+		});
+		const localBuffer = new TextEncoder().encode('local draft').buffer;
+		const cloudBuffer = new TextEncoder().encode('cloud refined').buffer;
+
+		plugin.settings.driveIdToPath = { 'note-id': 'note.md' };
+		plugin.settings.operations = { 'note.md': 'modify' };
+		plugin.settings.lastSyncedAt = Date.parse('2026-11-14T07:00:00.000Z');
+		plugin.app.vault.getAllLoadedFiles.mockReturnValue([{ path: 'note.md' }]);
+		plugin.app.vault.getFileByPath.mockReturnValue(localFile);
+		plugin.app.vault.adapter.readBinary.mockResolvedValueOnce(localBuffer);
+		plugin.drive.scanVaultTree.mockResolvedValueOnce([
+			{
+				file: {
+					id: 'note-id',
+					name: 'note.md',
+					mimeType: 'text/markdown',
+					modifiedTime: '2026-11-14T10:00:00.000Z',
+				},
+				path: 'note.md',
+			},
+		]);
+		plugin.drive.getFile.mockReturnValue({
+			arrayBuffer: vi.fn(async () => cloudBuffer),
+		});
+
+		await expect(pull(plugin as never, true)).resolves.toBe(true);
+
+		expect(plugin.app.vault.adapter.writeBinary).toHaveBeenCalledWith(
+			expect.stringMatching(/^note\.conflict-\d+\.md$/),
+			localBuffer,
+		);
+		expect(plugin.modifyFile).toHaveBeenCalledWith(
+			localFile,
+			cloudBuffer,
+			'2026-11-14T10:00:00.000Z',
+		);
+		expect(plugin.settings.operations).not.toHaveProperty('note.md');
+	});
+
+	it('forces cloud overwrite when forceCloud is true even if local is newer', async () => {
+		const plugin = createPlugin();
+		const localFile = new TFile();
+		Object.assign(localFile, {
+			path: 'note.md',
+			stat: { mtime: Date.parse('2026-11-14T12:00:00.000Z') },
+		});
+		const cloudBuffer = new TextEncoder().encode('cloud version').buffer;
+
+		plugin.settings.driveIdToPath = { 'note-id': 'note.md' };
+		plugin.settings.operations = { 'note.md': 'modify' };
+		plugin.settings.backupOnConflict = false;
+		plugin.app.vault.getAllLoadedFiles.mockReturnValue([{ path: 'note.md' }]);
+		plugin.app.vault.getFileByPath.mockReturnValue(localFile);
+		plugin.drive.scanVaultTree.mockResolvedValueOnce([
+			{
+				file: {
+					id: 'note-id',
+					name: 'note.md',
+					mimeType: 'text/markdown',
+					modifiedTime: '2026-11-14T10:00:00.000Z',
+				},
+				path: 'note.md',
+			},
+		]);
+		plugin.drive.getFile.mockReturnValue({
+			arrayBuffer: vi.fn(async () => cloudBuffer),
+		});
+
+		await expect(pull(plugin as never, true, true)).resolves.toBe(true);
+
+		expect(plugin.app.vault.adapter.writeBinary).not.toHaveBeenCalled();
+		expect(plugin.modifyFile).toHaveBeenCalledWith(
+			localFile,
+			cloudBuffer,
+			'2026-11-14T10:00:00.000Z',
+		);
+		expect(plugin.settings.operations).not.toHaveProperty('note.md');
+	});
+
+	it('syncs Drive renames/moves and trashed files', async () => {
+		const plugin = createPlugin();
+		const movedFile = new TFile();
+		Object.assign(movedFile, { path: 'old.md' });
+		const trashedFile = new TFile();
+		Object.assign(trashedFile, { path: 'trashed.md' });
+
+		plugin.settings.driveIdToPath = {
+			'moved-id': 'old.md',
+			'trashed-id': 'trashed.md',
+		};
+		plugin.app.vault.getAllLoadedFiles.mockReturnValue([
+			{ path: 'old.md' },
+			{ path: 'trashed.md' },
+		]);
+		plugin.app.vault.getAbstractFileByPath.mockImplementation(
+			(path: string) => {
+				if (path === 'old.md') return movedFile;
+				if (path === 'trashed.md') return trashedFile;
+				return null;
+			},
+		);
+		plugin.renameFile.mockImplementation(
+			async (file: TFile, newPath: string) => {
+				file.path = newPath;
+			},
+		);
+		plugin.app.vault.getFileByPath.mockImplementation((path: string) =>
+			path === 'Moved/new.md' && movedFile.path === 'Moved/new.md'
+				? movedFile
+				: null,
+		);
+		plugin.drive.scanVaultTree.mockResolvedValueOnce([
+			{
+				file: {
+					id: 'moved-id',
+					name: 'new.md',
+					mimeType: 'text/markdown',
+					modifiedTime: '2026-11-14T11:00:00.000Z',
+				},
+				path: 'Moved/new.md',
+			},
+		]);
+		plugin.drive.getChanges.mockResolvedValueOnce([
+			{
+				removed: false,
+				fileId: 'trashed-id',
+				file: { trashed: true },
+			},
+		]);
+		plugin.drive.getFile.mockReturnValue({
+			arrayBuffer: vi.fn(async () => new ArrayBuffer(4)),
+		});
+
+		await expect(pull(plugin as never, true)).resolves.toBe(true);
+
+		expect(plugin.createFolder).toHaveBeenCalledWith('Moved');
+		expect(plugin.renameFile).toHaveBeenCalledWith(
+			movedFile,
+			'Moved/new.md',
+		);
+		expect(plugin.drive.deleteFilesMinimumOperations).toHaveBeenCalledWith([
+			trashedFile,
+		]);
+		expect(plugin.settings.driveIdToPath).toEqual({
+			'moved-id': 'Moved/new.md',
 		});
 	});
 });

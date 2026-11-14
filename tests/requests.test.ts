@@ -14,7 +14,12 @@ vi.mock('obsidian', () => ({
 	requestUrl: mocks.requestUrl,
 }));
 
-import { getDriveAgent, refreshAccessToken } from '../helpers/requests';
+import {
+	buildGoogleAuthUrl,
+	exchangeCodeForRefreshToken,
+	getDriveAgent,
+	refreshAccessToken,
+} from '../helpers/requests';
 
 const response = (status: number, json: unknown = {}, text = '') => ({
 	status,
@@ -166,6 +171,52 @@ describe('getDriveAgent', () => {
 				body: '{"name":"note.md"}',
 				contentType: 'application/json',
 				throw: false,
+			}),
+		);
+	});
+});
+
+describe('OAuth full Drive scope helper', () => {
+	beforeEach(() => {
+		mocks.requestUrl.mockReset();
+	});
+
+	it('builds Google OAuth URL with full drive scope', () => {
+		const url = new URL(buildGoogleAuthUrl('my-client-id'));
+
+		expect(url.origin + url.pathname).toBe(
+			'https://accounts.google.com/o/oauth2/v2/auth',
+		);
+		expect(url.searchParams.get('client_id')).toBe('my-client-id');
+		expect(url.searchParams.get('scope')).toBe(
+			'https://www.googleapis.com/auth/drive',
+		);
+		expect(url.searchParams.get('access_type')).toBe('offline');
+	});
+
+	it('extracts code from localhost redirect URL and exchanges for refresh token', async () => {
+		mocks.requestUrl.mockResolvedValueOnce(
+			response(200, { refresh_token: 'new-refresh-token' }),
+		);
+
+		const token = await exchangeCodeForRefreshToken(
+			'cid',
+			'csecret',
+			'http://localhost/?code=4%2F0AuthCode123&scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdrive',
+		);
+
+		expect(token).toBe('new-refresh-token');
+		expect(mocks.requestUrl).toHaveBeenCalledWith(
+			expect.objectContaining({
+				url: 'https://oauth2.googleapis.com/token',
+				method: 'POST',
+				body: new URLSearchParams({
+					client_id: 'cid',
+					client_secret: 'csecret',
+					code: '4/0AuthCode123',
+					grant_type: 'authorization_code',
+					redirect_uri: 'http://localhost',
+				}).toString(),
 			}),
 		);
 	});

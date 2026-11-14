@@ -8,9 +8,15 @@ export interface FileMetadata {
 	description: string;
 	mimeType: string;
 	starred: boolean;
-	properties: Record<string, string>;
+	parents?: string[];
+	properties?: Record<string, string>;
 	modifiedTime: string;
 	trashed: boolean;
+}
+
+export interface VaultTreeEntry {
+	file: FileMetadata;
+	path: string;
 }
 
 type StringSearch = string | { contains: string } | { not: string };
@@ -29,12 +35,13 @@ interface QueryMatch {
 interface Change {
 	kind: string;
 	removed: boolean;
-	file: FileMetadata;
+	file?: Partial<FileMetadata>;
 	fileId: string;
 	time: string;
 }
 
 export const folderMimeType = 'application/vnd.google-apps.folder';
+export const googleDocMimeType = 'application/vnd.google-apps.document';
 
 const BLACKLISTED_CONFIG_FILES = [
 	'graph.json',
@@ -105,7 +112,8 @@ export const splitPath = (path: string) => {
 	return output;
 };
 
-export const unSplitPath = (properties: Record<string, string>) => {
+export const unSplitPath = (properties?: Record<string, string>) => {
+	if (!properties) return '';
 	let path = properties.path || '';
 	let i = 2;
 	while (properties[`path${i}`]) {
@@ -391,8 +399,141 @@ export const getDriveClient = (t: ObsidianGoogleDrive) => {
 	const getFile = (id: string) =>
 		drive.get(`drive/v3/files/${id}?alt=media&acknowledgeAbuse=true`);
 
+	const exportFile = (id: string, mimeType = 'text/markdown') =>
+		drive.get(
+			`drive/v3/files/${id}/export?mimeType=${encodeURIComponent(mimeType)}`,
+		);
+
 	const getFileMetadata = (id: string) =>
 		drive.get(`drive/v3/files/${id}`).json<FileMetadata>();
+
+	const scanVaultTree = async (
+		healMetadata = true,
+	): Promise<VaultTreeEntry[] | undefined> => {
+		const rootId = await getRootFolderId();
+		if (!rootId) return;
+
+		const entries: VaultTreeEntry[] = [];
+		let currentWave: { id: string; prefix: string }[] = [
+			{ id: rootId, prefix: '' },
+		];
+
+		while (currentWave.length > 0) {
+			const parentMap = new Map(
+				currentWave.map((item) => [item.id, item.prefix]),
+			);
+			const parentIds = currentWave.map((item) => item.id);
+			const nextWave: { id: string; prefix: string }[] = [];
+
+			for (let i = 0; i < parentIds.length; i += 25) {
+				const batchIds = parentIds.slice(i, i + 25);
+				const parentQuery = batchIds
+					.map((id) => `'${escapeQueryValue(id)}' in parents`)
+					.join(' or ');
+				const q = encodeURIComponent(
+					`(${parentQuery}) and trashed=false`,
+				);
+				const fields =
+					'nextPageToken,files(id,name,mimeType,parents,properties,modifiedTime,trashed)';
+
+				let pageToken: string | undefined = undefined;
+				do {
+					const url: string = `drive/v3/files?fields=${fields}&pageSize=1000&q=${q}&orderBy=name desc${
+						pageToken ? '&pageToken=' + pageToken : ''
+					}`;
+					const page:
+						| {
+								nextPageToken?: string;
+								files: FileMetadata[];
+						  }
+						| undefined = await drive.get(url).json<{
+						nextPageToken?: string;
+						files: FileMetadata[];
+					}>();
+					if (!page) return;
+
+					for (const file of page.files) {
+						if (file.properties?.obsidian === 'vault') continue;
+						const matchedParent =
+							file.parents?.find((p) => parentMap.has(p)) ??
+							batchIds[0];
+						const prefix = matchedParent
+							? (parentMap.get(matchedParent) ?? '')
+							: '';
+						let actualPath = prefix
+							? `${prefix}/${file.name}`
+							: file.name;
+						if (
+							file.mimeType === googleDocMimeType &&
+							!actualPath.endsWith('.md')
+						) {
+							actualPath += '.md';
+						}
+						entries.push({ file, path: actualPath });
+						if (file.mimeType === folderMimeType) {
+							nextWave.push({ id: file.id, prefix: actualPath });
+						}
+					}
+
+					pageToken = page.nextPageToken;
+				} while (pageToken);
+			}
+
+			currentWave = nextWave;
+		}
+
+		if (healMetadata) {
+			const vaultName = t.app.vault.getName();
+			const toHeal = entries.filter(({ file, path }) => {
+				const props = file.properties;
+				return (
+					!props ||
+					props.vault !== vaultName ||
+					unSplitPath(props) !== path
+				);
+			});
+
+			if (toHeal.length) {
+				await batchAsync(
+					toHeal.map(({ file, path }) => async () => {
+						const existing = file.properties ?? {};
+						const newPathProps = splitPath(path);
+						const cleanedOldPathKeys: Record<
+							string,
+							string | null
+						> = {};
+						for (const key of Object.keys(existing)) {
+							if (
+								(key === 'path' || /^path\d+$/.test(key)) &&
+								!(key in newPathProps)
+							) {
+								cleanedOldPathKeys[key] = null;
+							}
+						}
+						const updatedProperties = {
+							...existing,
+							...cleanedOldPathKeys,
+							vault: vaultName,
+							...newPathProps,
+						} as unknown as Record<string, string>;
+						file.properties = {
+							...existing,
+							vault: vaultName,
+							...newPathProps,
+						};
+						for (const k of Object.keys(cleanedOldPathKeys)) {
+							delete file.properties[k];
+						}
+						await updateFileMetadata(file.id, {
+							properties: updatedProperties,
+						});
+					}),
+				);
+			}
+		}
+
+		return entries;
+	};
 
 	const idFromPath = async (path: string) => {
 		const files = await searchFiles({
@@ -475,6 +616,7 @@ export const getDriveClient = (t: ObsidianGoogleDrive) => {
 						pageToken: token,
 						pageSize: '1000',
 						includeRemoved: 'true',
+						fields: 'nextPageToken,newStartPageToken,changes(removed,fileId,time,file(id,trashed,parents,properties))',
 					}).toString()}`,
 				)
 				.json<{
@@ -588,7 +730,9 @@ export const getDriveClient = (t: ObsidianGoogleDrive) => {
 		updateFileMetadata,
 		deleteFile,
 		getFile,
+		exportFile,
 		getFileMetadata,
+		scanVaultTree,
 		idFromPath,
 		idsFromPaths,
 		getChangesStartToken,

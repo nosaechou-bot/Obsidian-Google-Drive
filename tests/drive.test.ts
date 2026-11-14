@@ -9,7 +9,12 @@ vi.mock('obsidian', () => ({
 	TFolder: class {},
 }));
 
-import { getDriveClient, splitPath, unSplitPath } from '../helpers/drive';
+import {
+	getDriveClient,
+	googleDocMimeType,
+	splitPath,
+	unSplitPath,
+} from '../helpers/drive';
 
 const createPlugin = () =>
 	({
@@ -44,6 +49,10 @@ describe('Drive path properties', () => {
 				(part) => encoder.encode(part).length <= 100,
 			),
 		).toBe(true);
+	});
+
+	it('returns an empty string when properties are undefined', () => {
+		expect(unSplitPath(undefined)).toBe('');
 	});
 });
 
@@ -171,5 +180,175 @@ describe('Drive root folder persistence', () => {
 
 		expect(requestUrl).toHaveBeenCalledOnce();
 		expect(plugin.saveSettings).toHaveBeenCalledOnce();
+	});
+});
+
+describe('Drive export, changes, and tree scanning', () => {
+	beforeEach(() => {
+		requestUrl.mockReset();
+	});
+
+	it('exports Google Docs as text/markdown', async () => {
+		requestUrl.mockResolvedValueOnce({
+			status: 200,
+			headers: {},
+			arrayBuffer: new TextEncoder().encode('# Doc').buffer,
+			json: {},
+			text: '# Doc',
+		});
+		const drive = getDriveClient(createPlugin());
+
+		const res = await drive.exportFile('doc-1');
+
+		await expect(res.text()).resolves.toBe('# Doc');
+		expect(requestUrl).toHaveBeenCalledWith(
+			expect.objectContaining({
+				url: 'https://www.googleapis.com/drive/v3/files/doc-1/export?mimeType=text%2Fmarkdown',
+				method: 'GET',
+			}),
+		);
+	});
+
+	it('requests file trashed, parents, and properties fields in getChanges', async () => {
+		requestUrl.mockResolvedValueOnce({
+			status: 200,
+			headers: {},
+			arrayBuffer: new ArrayBuffer(0),
+			text: '',
+			json: {
+				changes: [
+					{
+						removed: false,
+						fileId: 'trashed-id',
+						file: { id: 'trashed-id', trashed: true },
+					},
+				],
+			},
+		});
+		const drive = getDriveClient(createPlugin());
+
+		const changes = await drive.getChanges('token-1');
+
+		expect(changes).toHaveLength(1);
+		const call = requestUrl.mock.calls[0]?.[0] as { url: string };
+		expect(decodeURIComponent(call.url)).toContain(
+			'changes(removed,fileId,time,file(id,trashed,parents,properties))',
+		);
+	});
+
+	it('scans nested folders, normalizes Google Docs to .md, and self-heals properties', async () => {
+		const plugin = {
+			accessToken: {
+				token: 'access-token',
+				expiresAt: Date.now() + 3_600_000,
+			},
+			app: { vault: { getName: () => 'Test vault' } },
+			settings: {
+				refreshToken: 'refresh-token',
+				rootFolderId: 'root-id',
+			},
+			saveSettings: vi.fn(async () => undefined),
+		};
+
+		requestUrl.mockImplementation(
+			async ({ url, method }: { url: string; method?: string }) => {
+				if (method === 'PATCH') {
+					return {
+						status: 200,
+						headers: {},
+						arrayBuffer: new ArrayBuffer(0),
+						text: '',
+						json: { id: url.split('/').pop() },
+					};
+				}
+				const decodedUrl = decodeURIComponent(url);
+				if (decodedUrl.includes("'root-id' in parents")) {
+					return {
+						status: 200,
+						headers: {},
+						arrayBuffer: new ArrayBuffer(0),
+						text: '',
+						json: {
+							files: [
+								{
+									id: 'daily-folder',
+									name: 'Daily',
+									mimeType:
+										'application/vnd.google-apps.folder',
+									parents: ['root-id'],
+									modifiedTime: '2026-11-14T00:00:00.000Z',
+									trashed: false,
+								},
+								{
+									id: 'gdoc-1',
+									name: '物理筆記',
+									mimeType: googleDocMimeType,
+									parents: ['root-id'],
+									modifiedTime: '2026-11-14T00:00:00.000Z',
+									trashed: false,
+								},
+							],
+						},
+					};
+				}
+				if (decodedUrl.includes("'daily-folder' in parents")) {
+					return {
+						status: 200,
+						headers: {},
+						arrayBuffer: new ArrayBuffer(0),
+						text: '',
+						json: {
+							files: [
+								{
+									id: 'daily-note',
+									name: '2026-11-14.md',
+									mimeType: 'text/markdown',
+									parents: ['daily-folder'],
+									properties: {
+										vault: 'Test vault',
+										path: 'Old/2026-11-14.md',
+										path2: 'extra-chunk',
+									},
+									modifiedTime: '2026-11-14T01:00:00.000Z',
+									trashed: false,
+								},
+							],
+						},
+					};
+				}
+				return {
+					status: 200,
+					headers: {},
+					arrayBuffer: new ArrayBuffer(0),
+					text: '',
+					json: { files: [] },
+				};
+			},
+		);
+
+		const drive = getDriveClient(plugin as never);
+		const entries = await drive.scanVaultTree();
+
+		expect(entries?.map((e) => ({ id: e.file.id, path: e.path }))).toEqual([
+			{ id: 'daily-folder', path: 'Daily' },
+			{ id: 'gdoc-1', path: '物理筆記.md' },
+			{ id: 'daily-note', path: 'Daily/2026-11-14.md' },
+		]);
+
+		const patchCalls = requestUrl.mock.calls
+			.map((c) => c[0] as { url: string; method?: string; body?: string })
+			.filter((c) => c.method === 'PATCH');
+
+		expect(patchCalls).toHaveLength(3);
+		const dailyNotePatch = patchCalls.find((c) =>
+			c.url.endsWith('/daily-note'),
+		);
+		expect(JSON.parse(dailyNotePatch?.body ?? '{}')).toEqual({
+			properties: {
+				vault: 'Test vault',
+				path: 'Daily/2026-11-14.md',
+				path2: null,
+			},
+		});
 	});
 });

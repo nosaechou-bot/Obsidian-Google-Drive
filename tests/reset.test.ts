@@ -79,17 +79,15 @@ describe('reset', () => {
 		const content = new ArrayBuffer(3);
 		const syncNotice = { setMessage: vi.fn(), hide: vi.fn() };
 		const drive = {
-			searchFiles: vi
-				.fn()
-				.mockResolvedValueOnce([])
-				.mockResolvedValueOnce([
-					{
-						id: 'deleted-id',
-						mimeType: 'text/markdown',
-						properties: { path: 'deleted.md' },
-						modifiedTime: '2025-01-01T00:00:00.000Z',
-					},
-				]),
+			scanVaultTree: vi.fn(async () => []),
+			searchFiles: vi.fn().mockResolvedValueOnce([
+				{
+					id: 'deleted-id',
+					mimeType: 'text/markdown',
+					properties: { path: 'deleted.md' },
+					modifiedTime: '2025-01-01T00:00:00.000Z',
+				},
+			]),
 			getChanges: vi.fn(async () => []),
 			deleteFilesMinimumOperations: vi.fn(async () => undefined),
 			getFile: vi.fn(() => ({
