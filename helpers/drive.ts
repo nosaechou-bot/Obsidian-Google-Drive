@@ -238,13 +238,27 @@ export const getDriveClient = (t: ObsidianGoogleDrive) => {
 			return t.settings.rootFolderId;
 		}
 
-		const files = await searchFiles(
+		let files = await searchFiles(
 			{
 				matches: [{ properties: { obsidian: 'vault' } }],
 			},
 			true,
 		);
 		if (!files) return;
+		const vaultName = t.app.vault.getName();
+		const trimmedVaultName = vaultName.trim();
+		if (!files.length && trimmedVaultName && trimmedVaultName !== vaultName) {
+			const q = encodeURIComponent(
+				`trashed=false and properties has { key='obsidian' and value='vault' } and properties has { key='vault' and value='${escapeQueryValue(trimmedVaultName)}' }`,
+			);
+			const trimmedResult = await drive
+				.get(
+					`drive/v3/files?fields=files(id,name,properties)&pageSize=10&q=${q}`,
+				)
+				.json<{ files: FileMetadata[] }>();
+			if (!trimmedResult) return;
+			files = trimmedResult.files;
+		}
 		if (!files.length) {
 			const rootFolder = await drive
 				.post(`drive/v3/files`, {
@@ -409,8 +423,9 @@ export const getDriveClient = (t: ObsidianGoogleDrive) => {
 
 	const scanVaultTree = async (
 		healMetadata = true,
+		verifyRoot = false,
 	): Promise<VaultTreeEntry[] | undefined> => {
-		const rootId = await getRootFolderId();
+		const rootId = await getRootFolderId(verifyRoot);
 		if (!rootId) return;
 
 		const entries: VaultTreeEntry[] = [];

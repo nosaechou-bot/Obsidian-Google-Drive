@@ -50,7 +50,7 @@ export const pull = async (
 			}
 		}
 
-		const treeEntries = await t.drive.scanVaultTree();
+		const treeEntries = await t.drive.scanVaultTree(true, forceCloud);
 		if (!treeEntries) {
 			new Notice('An error occurred fetching Google Drive files.');
 			t.abortSync(syncNotice);

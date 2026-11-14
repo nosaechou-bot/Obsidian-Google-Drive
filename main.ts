@@ -565,6 +565,15 @@ class SettingsTab extends PluginSettingTab {
 				},
 			},
 			{
+				name: 'Root folder ID',
+				desc: 'Google Drive folder ID for this vault. Clear this field and run Force pull to re-detect the vault folder.',
+				control: {
+					type: 'text',
+					key: 'rootFolderId',
+					placeholder: 'Auto-detected from vault name',
+				},
+			},
+			{
 				name: 'Authorize full Drive access (for Gemini and external files)',
 				desc: 'Enter Client ID and Client secret above, open the auth URL, sign in, then paste the redirected localhost URL or code parameter below.',
 				render: (setting) => {
